@@ -1,3 +1,5 @@
+M5 OS firmware
+
 #include <M5Stack.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -126,7 +128,7 @@ void themeSwitchMenu() {
             switchTheme(selectedTheme + 1);  // Switch theme based on selection
             fadeOut();
             fadeIn();
-        } else if (M5.BtnD.wasPressed()) {
+        } else if (M5.BtnB.pressedFor(1000)) {  // Use BtnB for exiting instead of BtnD
             // Exit the theme switch menu and return to the main menu
             fadeOut();
             mainMenu();
@@ -164,7 +166,6 @@ void switchTheme(uint8_t theme) {
     M5.Lcd.setTextColor(themePrimaryColor, TFT_BLACK);
 }
 
-// Remaining functions are unchanged
 // Function to display available WiFi networks and allow user to select one
 void selectWiFiNetwork() {
     M5.Lcd.clear();
@@ -240,6 +241,7 @@ void inputPassword() {
 
         if (M5.BtnA.wasPressed()) {
             charIndex = (charIndex > 0) ? charIndex - 1 : mapSize - 1;
+
         } else if (M5.BtnC.wasPressed()) {
             charIndex = (charIndex + 1) % mapSize;
         } else if (M5.BtnB.wasPressed()) {
@@ -366,7 +368,14 @@ bool downloadAndInstallFirmware(const FirmwareInfo &info) {
         return false;
     }
 
-    firmwareFile.write(http.getStream(), http.getSize());
+    WiFiClient *stream = http.getStreamPtr();
+    uint8_t buffer[512];
+    int bytesRead;
+    
+    while ((bytesRead = stream->read(buffer, sizeof(buffer))) > 0) {
+        firmwareFile.write(buffer, bytesRead);
+    }
+
     firmwareFile.close();
     http.end();
 
@@ -492,7 +501,8 @@ void listInstalledFirmware() {
         M5.Lcd.clear();
         M5.Lcd.setCursor(10, 10);
         M5.Lcd.setTextSize(2);
-                M5.Lcd.setTextColor(themeSecondaryColor);
+
+        M5.Lcd.setTextColor(themeSecondaryColor);
         M5.Lcd.println("No firmware found.");
         delay(2000);
         return;
