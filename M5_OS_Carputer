@@ -4,6 +4,7 @@
 #include <SD.h>
 #include <SPI.h>
 #include <ArduinoJson.h>
+#include <esp_task_wdt.h>  // For Watchdog Timer
 
 // Constants for paths and WiFi credentials
 const char* firmwareDir = "/firmware/";
@@ -36,14 +37,21 @@ std::vector<FirmwareInfo> installedFirmware;
 String ssid = "";       // User-selected WiFi SSID
 String password = "";   // User-entered WiFi password
 
-// Initialize M5Stack and SD card
+// Flag for firmware exit using interrupt
+volatile bool firmwareExitRequested = false;
+
+// Initialize M5Stack, SD card, and Watchdog Timer
 void initializeSystem() {
     M5.begin();
     Serial.begin(115200);
 
+    // Initialize Watchdog Timer with a 10-second timeout
+    esp_task_wdt_init(10, true);
+    esp_task_wdt_add(NULL);  // Add the main loop task to the watchdog
+
     if (!SD.begin()) {
         Serial.println("SD card initialization failed!");
-        while (1);
+        while (1);  // Infinite loop if SD card fails to initialize
     }
     Serial.println("SD card initialized.");
 }
@@ -179,7 +187,7 @@ void selectWiFiNetwork() {
 
     int selectedIndex = 0;
 
-     while (true) {
+    while (true) {
         M5.Lcd.clear();
         for (int i = 0; i < numNetworks; ++i) {
             if (i == selectedIndex) {
@@ -224,6 +232,7 @@ void inputPassword() {
     while (true) {
         M5.Lcd.clear();
         M5.Lcd.setCursor(10, 10);
+        M5.Lcd.setTextSize(2);
         M5.Lcd.setTextColor(themePrimaryColor);
         M5.Lcd.println("Enter WiFi Password:");
         M5.Lcd.setCursor(10, 40);
@@ -246,8 +255,7 @@ void inputPassword() {
                 length++;
                 passwordBuffer[length] = '\0';
             }
-        } else if (M5.BtnB.pressedFor(1000)) {
-            // Long press confirms the password
+        } else if (M5.BtnB.pressedFor(1000)) {  // Long press confirms the password
             password = passwordBuffer;
             M5.Lcd.clear();
             M5.Lcd.setCursor(10, 10);
@@ -336,7 +344,7 @@ void downloadFirmwareList() {
     http.end();
 }
 
-// Function to download and install selected firmware with error handling
+// Function to download and install selected firmware with error handling and optimized I/O
 bool downloadAndInstallFirmware(const FirmwareInfo &info) {
     HTTPClient http;
     http.begin(info.url);
@@ -365,11 +373,28 @@ bool downloadAndInstallFirmware(const FirmwareInfo &info) {
     }
 
     WiFiClient *stream = http.getStreamPtr();
-    uint8_t buffer[512];
-    int bytesRead;
-    
-    while ((bytesRead = stream->read(buffer, sizeof(buffer))) > 0) {
+    uint8_t buffer[512];  // 512-byte buffer for chunked I/O
+    size_t bytesRead;
+    size_t totalBytesRead = 0;
+    size_t firmwareSize = http.getSize();
+
+    M5.Lcd.clear();
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setTextColor(themePrimaryColor);
+    M5.Lcd.println("Downloading firmware...");
+
+    while (stream->connected() && (bytesRead = stream->readBytes(buffer, sizeof(buffer))) > 0) {
         firmwareFile.write(buffer, bytesRead);
+        totalBytesRead += bytesRead;
+
+        // Update progress bar
+        int progress = (totalBytesRead * 100) / firmwareSize;
+        M5.Lcd.fillRect(10, 40, 200, 20, TFT_BLACK);  // Clear previous progress bar
+        M5.Lcd.drawRect(10, 40, 200, 20, themeSecondaryColor);  // Draw progress bar outline
+        M5.Lcd.fillRect(10, 40, progress * 2, 20, themePrimaryColor);  // Fill progress bar
+
+        esp_task_wdt_reset();  // Reset the watchdog to prevent timeout
     }
 
     firmwareFile.close();
@@ -404,7 +429,12 @@ bool downloadAndInstallFirmware(const FirmwareInfo &info) {
     return true;
 }
 
-// Function to execute firmware with escape functionality
+// Interrupt handler for exiting firmware execution
+void IRAM_ATTR onButtonAPress() {
+    firmwareExitRequested = true;
+}
+
+// Function to execute firmware with interrupt-based exit mechanism
 void executeFirmware(const String &firmwareName) {
     String firmwarePath = String(firmwareDir) + firmwareName + ".bin";
     File firmwareFile = SD.open(firmwarePath, FILE_READ);
@@ -418,7 +448,7 @@ void executeFirmware(const String &firmwareName) {
         return;
     }
 
-        void* firmwareMemory = malloc(firmwareFile.size());
+    void* firmwareMemory = malloc(firmwareFile.size());
     if (firmwareMemory == nullptr) {
         M5.Lcd.clear();
         M5.Lcd.setCursor(10, 10);
@@ -433,21 +463,30 @@ void executeFirmware(const String &firmwareName) {
     firmwareFile.read((uint8_t*)firmwareMemory, firmwareFile.size());
     firmwareFile.close();
 
-    // Add a loop to allow exiting the firmware
+    // Set up the interrupt to exit the firmware execution when BtnA is pressed
+    firmwareExitRequested = false;
+    attachInterrupt(digitalPinToInterrupt(M5.BtnA.pin), onButtonAPress, FALLING);
+
+    // Execute the firmware code
     bool exitFirmware = false;
     while (!exitFirmware) {
-        M5.update();  // Check for button presses
-        if (M5.BtnA.wasPressed()) {  // Treat BtnA as the Escape key
+        M5.update();  // Update button states
+
+        if (firmwareExitRequested) {  // Check if the exit flag was set by the interrupt
             exitFirmware = true;  // Exit the firmware and return to the main menu
+        } else {
+            // Execute the firmware code here (simulate execution in this example)
+            void (*firmwareEntryPoint)() = (void (*)())firmwareMemory;
+            firmwareEntryPoint();  // Execute the firmware
         }
 
-        // Execute the firmware code (in this case, we'll just simulate execution)
-        void (*firmwareEntryPoint)() = (void (*)())firmwareMemory;
-        firmwareEntryPoint();  // Execute the firmware
+        esp_task_wdt_reset();  // Reset the watchdog timer during execution
     }
 
-    // After execution, return to main menu
+    // Clean up after execution
     free(firmwareMemory);
+    detachInterrupt(digitalPinToInterrupt(M5.BtnA.pin));  // Detach the interrupt
+
     fadeOut();
     M5.Lcd.clear();
     fadeIn();
@@ -535,63 +574,8 @@ void listInstalledFirmware() {
     }
 }
 
-// Function to display available firmware for download
-void displayAvailableFirmware() {
-    int selectedIndex = 0;
-
-    while (true) {
-        M5.Lcd.clear();
-        M5.Lcd.setTextSize(2);
-        for (size_t i = 0; i < availableFirmware.size(); ++i) {
-            if (i == selectedIndex) {
-                M5.Lcd.setTextColor(themePrimaryColor, TFT_BLACK);  // Highlight selected item
-            } else {
-                M5.Lcd.setTextColor(themeSecondaryColor, TFT_BLACK);
-            }
-            M5.Lcd.setCursor(10, 10 + i * 40);
-            M5.Lcd.printf("Name: %s", availableFirmware[i].name.c_str());
-            M5.Lcd.setCursor(10, 40 + i * 40);
-            M5.Lcd.setTextColor(themePrimaryColor);
-            M5.Lcd.printf("Version: %s", availableFirmware[i].version.c_str());
-            M5.Lcd.setCursor(200, 40 + i * 40);
-            M5.Lcd.setTextColor(themeSecondaryColor);
-            M5.Lcd.printf("Size: %d bytes", availableFirmware[i].size);
-        }
-
-        // Handle button presses for navigation (A = up, C = down, B = select/download)
-        M5.update();
-        if (M5.BtnA.wasPressed()) {
-            selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : availableFirmware.size() - 1;
-        } else if (M5.BtnC.wasPressed()) {
-            selectedIndex = (selectedIndex + 1) % availableFirmware.size();
-        } else if (M5.BtnB.wasPressed()) {
-            // Download and install the selected firmware
-            fadeOut();
-            bool success = downloadAndInstallFirmware(availableFirmware[selectedIndex]);
-            fadeIn();
-            if (success) {
-                M5.Lcd.clear();
-                M5.Lcd.setCursor(10, 10);
-                M5.Lcd.setTextSize(2);
-                M5.Lcd.setTextColor(themePrimaryColor);
-                M5.Lcd.println("Firmware installed successfully.");
-            } else {
-                M5.Lcd.clear();
-                M5.Lcd.setCursor(10, 10);
-                M5.Lcd.setTextSize(2);
-                M5.Lcd.setTextColor(themeSecondaryColor);
-                M5.Lcd.println("Failed to install firmware.");
-            }
-            delay(2000);
-            break;  // After installation, break to return to main menu
-        }
-
-        delay(100);  // Small delay to debounce button presses
-    }
-}
-
-// Advanced file explorer function
-void displayFileExplorer(const char* path) {
+// Advanced file explorer function with breadcrumbs navigation
+void displayFileExplorer(const String& path) {
     File dir = SD.open(path);
 
     if (!dir) {
@@ -628,29 +612,49 @@ void displayFileExplorer(const char* path) {
     }
 
     int selectedIndex = 0;
+    size_t pageStart = 0;
+    const size_t pageSize = 5;  // Display 5 files at a time
+    String currentPath = path;  // Track the current path for breadcrumb navigation
 
     // Display the list of files
     while (true) {
         M5.Lcd.clear();
         M5.Lcd.setTextSize(2);
-        for (size_t i = 0; i < files.size(); ++i) {
+
+        // Display the breadcrumb navigation
+        M5.Lcd.setCursor(10, 0);
+        M5.Lcd.setTextColor(themePrimaryColor);
+        M5.Lcd.print("Path: ");
+        M5.Lcd.println(currentPath);
+
+        size_t pageEnd = min(pageStart + pageSize, files.size());
+        for (size_t i = pageStart; i < pageEnd; ++i) {
             if (i == selectedIndex) {
                 M5.Lcd.setTextColor(themePrimaryColor, TFT_BLACK);  // Highlight selected item
             } else {
                 M5.Lcd.setTextColor(themeSecondaryColor, TFT_BLACK);
             }
-            M5.Lcd.setCursor(10, 10 + i * 30);
+            M5.Lcd.setCursor(10, 20 + (i - pageStart) * 30);
             M5.Lcd.printf("File: %s", files[i].c_str());
         }
 
-        // Handle button presses for navigation (A = up, C = down, B = select)
+        // Handle button presses for navigation (A = up, C = down, B = select, B long press = back)
         M5.update();
         if (M5.BtnA.wasPressed()) {
-            selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : files.size() - 1;
+            if (selectedIndex > 0) {
+                selectedIndex--;
+                if (selectedIndex < pageStart) {
+                    pageStart -= pageSize;
+                }
+            }
         } else if (M5.BtnC.wasPressed()) {
-            selectedIndex = (selectedIndex + 1) % files.size();
+            if (selectedIndex < files.size() - 1) {
+                selectedIndex++;
+                if (selectedIndex >= pageEnd) {
+                    pageStart += pageSize;
+                }
+            }
         } else if (M5.BtnB.wasPressed()) {
-                        // Show file details or perform operations (e.g., delete)
             String selectedFile = files[selectedIndex];
             M5.Lcd.clear();
             M5.Lcd.setCursor(10, 10);
@@ -686,21 +690,37 @@ void displayFileExplorer(const char* path) {
             // Refresh file list after action
             displayFileExplorer(path);
             break;
+        } else if (M5.BtnB.pressedFor(1000)) {  // Long press to go back
+            if (currentPath != "/") {
+                int lastSlash = currentPath.lastIndexOf('/');
+                if (lastSlash > 0) {
+                    currentPath = currentPath.substring(0, lastSlash);
+                } else {
+                    currentPath = "/";
+                }
+                displayFileExplorer(currentPath);
+            } else {
+                break;  // If at root, exit the explorer
+            }
         }
 
         delay(100);  // Small delay to debounce button presses
     }
 }
 
-// Main menu function
+// Main menu function with breadcrumbs
 void mainMenu() {
     fadeIn();
     while (true) {
         M5.Lcd.clear();
         M5.Lcd.setTextSize(2);
-        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.setCursor(10, 0);
+        M5.Lcd.setTextColor(themePrimaryColor);
+                M5.Lcd.setCursor(10, 0);
         M5.Lcd.setTextColor(themePrimaryColor);
         M5.Lcd.println("M5 OS Main Menu");
+
+        // Main menu options
         M5.Lcd.setCursor(10, 40);
         M5.Lcd.println("A: List Installed Firmware");
         M5.Lcd.setCursor(10, 70);
@@ -712,7 +732,7 @@ void mainMenu() {
         M5.Lcd.setCursor(10, 160);
         M5.Lcd.println("E: Theme Switch");
 
-        // Handle button presses for main menu options (A = Installed Firmware, B = Download Firmware, C = Refresh, D = File Explorer, E = Theme Switch)
+        // Handle button presses for main menu options
         M5.update();
         if (M5.BtnA.wasPressed()) {
             fadeOut();
@@ -721,7 +741,6 @@ void mainMenu() {
             fadeOut();
             downloadFirmwareList();   // Download the list of available firmware
             displayAvailableFirmware();  // Display and download new firmware
-
         } else if (M5.BtnC.wasPressed()) {
             fadeOut();
             downloadFirmwareList();  // Refresh firmware list from the server
@@ -732,10 +751,10 @@ void mainMenu() {
             M5.Lcd.setTextColor(themePrimaryColor);
             M5.Lcd.println("Firmware list refreshed.");
             delay(2000);
-        } else if (M5.BtnD.wasPressed()) {  // Handle for File Explorer
+        } else if (M5.BtnD.wasPressed()) {
             fadeOut();
             displayFileExplorer("/");  // Launch the file explorer starting from the root directory
-        } else if (M5.BtnE.wasPressed()) {  // Handle for Theme Switch
+        } else if (M5.BtnE.wasPressed()) {
             fadeOut();
             themeSwitchMenu();  // Open the theme switch menu
         }
