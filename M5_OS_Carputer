@@ -7,35 +7,31 @@
 #include <esp_task_wdt.h>
 #include <EEPROM.h>
 #include <Update.h>
-#include <avr/pgmspace.h>  // PROGMEM support
+#include <avr/pgmspace.h>
+#include <Ticker.h>
+#include <TaskScheduler.h>
+#include <vector>
+#include <map>
 
-// Constants for paths and WiFi credentials
+// Constants and Variables
 const char* firmwareDir = "/firmware/";
-const char* metadataFileName = "metadata.json";
-const char* firmwareListUrl = "http://m5launcher.com/firmware_list.json";
+uint16_t themePrimaryColor = 0xB6DFE9; // Light Baby Blue
+uint16_t themeSecondaryColor = 0x0083C6; // Darker Blue
+std::vector<FirmwareInfo> availableFirmware;
+std::vector<FirmwareInfo> installedFirmware;
 
-// PROGMEM usage for constant strings
-const char startupMessage[] PROGMEM = "M5 OS";
-const char customMessage[] PROGMEM = "Mr._Crack_Bot";
-const char byMessage[] PROGMEM = "by Salavadordata";
+#define SMALL_BLOCK_SIZE 64
+#define POOL_SIZE 1024
+#define LARGE_ALLOCATION_THRESHOLD 128
 
-// Colors for themes
-#define THEME_LIGHT_BLUE 0xB6DFE9  // Light Baby Blue
-#define THEME_DARK_BLUE  0x0083C6  // Darker Blue
-#define THEME_GREEN      0x00FF00  // Green Theme
-#define THEME_ORANGE     0xFFA500  // Orange Theme
-#define THEME_WHITE      0xFFFFFF  // White Theme
+char memoryPool[POOL_SIZE];
+bool memoryPoolAllocated[POOL_SIZE / SMALL_BLOCK_SIZE];
+std::vector<void**> pointerReferences;
+std::map<void*, bool> memoryMap;  // Tracks if memory is in use or not
 
-// Current theme colors
-uint16_t themePrimaryColor = THEME_LIGHT_BLUE;
-uint16_t themeSecondaryColor = THEME_DARK_BLUE;
-
-// Static allocation of buffers and data structures
 char wifiSSID[32];
-char wifiPassword[32];
-char firmwareBuffer[512];  // Example static buffer for firmware data
+char wifiPassword[32] = "";
 
-// Structure to hold firmware info
 struct FirmwareInfo {
     String name;
     String version;
@@ -45,46 +41,171 @@ struct FirmwareInfo {
     String previousVersion;
 };
 
-std::vector<FirmwareInfo> availableFirmware;
-std::vector<FirmwareInfo> installedFirmware;
+// Task Scheduler for asynchronous operations
+Scheduler taskScheduler;
+Task WiFiTask(0, TASK_FOREVER, &handleWiFiConnection, &taskScheduler, true);
+Task HealthCheckTask(1000, TASK_FOREVER, &checkSystemHealth, &taskScheduler, true);
+Task IdleMonitorTask(10000, TASK_FOREVER, &monitorIdleState, &taskScheduler, true);
+Task HeartbeatTask(1000, TASK_FOREVER, &heartbeatCheck, &taskScheduler, true);
+Task GarbageCollectorTask(5000, TASK_FOREVER, &runGarbageCollector, &taskScheduler, true);
 
-// Memory pool for small dynamic allocations (example: UI elements)
-#define POOL_SIZE 1024
-char memoryPool[POOL_SIZE];
-bool memoryPoolAllocated[POOL_SIZE / 64];
-
-// Function prototypes
+// Function Prototypes
 void initializeSystem();
-void fadeIn();
-void fadeOut();
 void displayStartupIntro();
 void displayCustomMessage();
-void themeSwitchMenu();
-void switchTheme(uint8_t theme);
-void selectWiFiNetwork();
-void inputPassword();
-void connectWiFi();
-void downloadFirmwareList();
-bool downloadAndInstallFirmware(const FirmwareInfo &info);
-void executeFirmware(const String &firmwareName);
-void listInstalledFirmware();
 void displayAvailableFirmware();
-void displayFileExplorer(const char* path);
+void listInstalledFirmware();
+void displayInstalledFirmwareMenu();
+void executeFirmware(const String &firmwareName);
 void mainMenu();
-void handleButtonInputs();
-void resetWatchdog();
-void errorHandler(const String &errorMsg, int retries = 3);
+void checkSystemHealth();
 void heartbeatCheck();
 void displayBatteryStatus();
-void gracefulDegradation();
-void memoryPoolInit();
-void *memoryAllocate(size_t size);
-void memoryFree(void *ptr);
-void checkSystemHealth();
-void breadcrumbsNav(String path);
-void fallbackFirmwareExecution(const String &firmwareName);
+void fadeIn();
+void fadeOut();
+void downloadFirmwareList();
+void themeSwitchMenu();
+void switchTheme(uint8_t theme);
+void displayFileExplorer(const char* path);
+void inputPassword();
+void selectWiFiNetwork();
+void connectWiFi();
+void debounceButtons();
+void monitorIdleState();
+void enterLowPowerMode();
+void runGarbageCollector();
+void logOperation(const char* operation);
 
-// Initialize M5Stack and SD card
+// Memory Management Functions
+template <typename T>
+class SmartPointer {
+private:
+    T* ptr;
+    size_t* refCount;
+
+public:
+    explicit SmartPointer(T* p = nullptr) : ptr(p), refCount(new size_t(1)) {
+        memoryMap[ptr] = true; // Mark this memory as in-use
+    }
+    SmartPointer(const SmartPointer& sp) : ptr(sp.ptr), refCount(sp.refCount) {
+        (*refCount)++;
+    }
+    ~SmartPointer() {
+        release();
+    }
+    SmartPointer& operator=(const SmartPointer& sp) {
+        if (this != &sp) {
+            release();
+            ptr = sp.ptr;
+            refCount = sp.refCount;
+            (*refCount)++;
+        }
+        return *this;
+    }
+    T& operator*() const {
+        return *ptr;
+    }
+    T* operator->() const {
+        return ptr;
+    }
+    T& operator[](size_t index) const {
+        return ptr[index];
+    }
+    T* get() const {
+        return ptr;
+    }
+    void release() {
+        if (--(*refCount) == 0) {
+            memoryMap[ptr] = false; // Mark memory as no longer in use
+            delete[] ptr;
+            delete refCount;
+        }
+    }
+    void updatePointer(T* newPtr) {
+        ptr = newPtr;
+    }
+};
+
+void memoryPoolInit() {
+    memset(memoryPoolAllocated, 0, sizeof(memoryPoolAllocated));
+    pointerReferences.clear();
+    memoryMap.clear();
+}
+
+void registerPointerReference(void** ptrRef) {
+    pointerReferences.push_back(ptrRef);
+}
+
+void* hybridMemoryAllocate(size_t size) {
+    if (size <= SMALL_BLOCK_SIZE) {
+        for (int i = 0; i < POOL_SIZE / SMALL_BLOCK_SIZE; i++) {
+            if (!memoryPoolAllocated[i]) {
+                memoryPoolAllocated[i] = true;
+                return &memoryPool[i * SMALL_BLOCK_SIZE];
+            }
+        }
+        memoryCompaction();
+        return hybridMemoryAllocate(size);
+    } else if (size > LARGE_ALLOCATION_THRESHOLD) {
+        return heap_caps_malloc(size, MALLOC_CAP_8BIT);
+    } else {
+        return malloc(size);
+    }
+}
+
+void hybridMemoryFree(void* ptr) {
+    if (ptr >= memoryPool && ptr < memoryPool + POOL_SIZE) {
+        int index = ((char*)ptr - memoryPool) / SMALL_BLOCK_SIZE;
+        memoryPoolAllocated[index] = false;
+        mergeAdjacentFreeBlocks();
+    } else {
+        free(ptr);
+    }
+}
+
+void mergeAdjacentFreeBlocks() {
+    for (int i = 0; i < POOL_SIZE / SMALL_BLOCK_SIZE - 1; i++) {
+        if (!memoryPoolAllocated[i] && !memoryPoolAllocated[i + 1]) {
+            memoryPoolAllocated[i] = false;
+            memoryPoolAllocated[i + 1] = false;
+        }
+    }
+}
+
+void memoryCompaction() {
+    int writeIndex = 0;
+    for (int readIndex = 0; readIndex < POOL_SIZE / SMALL_BLOCK_SIZE; readIndex++) {
+        if (memoryPoolAllocated[readIndex]) {
+            if (readIndex != writeIndex) {
+                memcpy(&memoryPool[writeIndex * SMALL_BLOCK_SIZE],
+                       &memoryPool[readIndex * SMALL_BLOCK_SIZE],
+                       SMALL_BLOCK_SIZE);
+                memoryPoolAllocated[writeIndex] = true;
+                memoryPoolAllocated[readIndex] = false;
+                for (void** ptrRef : pointerReferences) {
+                    if (*ptrRef == &memoryPool[readIndex * SMALL_BLOCK_SIZE]) {
+                        *ptrRef = &memoryPool[writeIndex * SMALL_BLOCK_SIZE];
+                    }
+                }
+            }
+            writeIndex++;
+        }
+    }
+}
+
+// Run the garbage collector to free unused memory
+void runGarbageCollector() {
+    for (auto it = memoryMap.begin(); it != memoryMap.end(); ) {
+        if (!it->second) {
+            hybridMemoryFree(it->first);
+            it = memoryMap.erase(it);
+        } else {
+            ++it;
+        }
+    }
+}
+
+// System Initialization
 void initializeSystem() {
     M5.begin();
     Serial.begin(115200);
@@ -92,116 +213,14 @@ void initializeSystem() {
     if (!SD.begin()) {
         errorHandler("SD card initialization failed!");
     }
-    Serial.println("SD card initialized.");
 
-    // Initialize watchdog timer for the main task
-    esp_task_wdt_init(10, true);  // Set the timeout to 10 seconds
-    esp_task_wdt_add(NULL);       // Add the current task (NULL represents the current task)
+    esp_task_wdt_init(10, true);
+    esp_task_wdt_add(NULL);
 
-    // Initialize custom memory pool
     memoryPoolInit();
 }
 
-// Memory pool initialization
-void memoryPoolInit() {
-    memset(memoryPoolAllocated, 0, sizeof(memoryPoolAllocated));
-}
-
-// Memory allocation using custom pool
-void *memoryAllocate(size_t size) {
-    for (int i = 0; i < POOL_SIZE / 64; i++) {
-        if (!memoryPoolAllocated[i]) {
-            memoryPoolAllocated[i] = true;
-            return &memoryPool[i * 64];
-        }
-    }
-    // If the pool is full, fall back to malloc
-    return malloc(size);
-}
-
-// Memory deallocation
-void memoryFree(void *ptr) {
-    if (ptr >= memoryPool && ptr < memoryPool + POOL_SIZE) {
-        int index = ((char *)ptr - memoryPool) / 64;
-        memoryPoolAllocated[index] = false;
-    } else {
-        free(ptr);
-    }
-}
-
-// Function to display the startup message and custom branding
-void displayStartupIntro() {
-    fadeIn();
-    M5.Lcd.clear();
-    M5.Lcd.setCursor(10, 10);
-    M5.Lcd.setTextSize(5);
-    M5.Lcd.setTextColor(THEME_WHITE);
-    M5.Lcd.println(FPSTR(startupMessage));
-    displayCustomMessage();
-    fadeOut();
-}
-
-// Function to display the custom message after the startup animation
-void displayCustomMessage() {
-    M5.Lcd.clear();
-    M5.Lcd.setCursor(10, 10);
-    M5.Lcd.setTextSize(3);
-    M5.Lcd.setTextColor(THEME_WHITE);
-    M5.Lcd.println(FPSTR(customMessage));
-    M5.Lcd.setCursor(10, 50);
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.println(FPSTR(byMessage));
-
-    delay(2300);  // Display the message for 2.3 seconds
-}
-
-// Function to display battery status
-void displayBatteryStatus() {
-    int batteryLevel = M5.Power.getBatteryLevel();
-    bool isCharging = M5.Power.isCharging();
-
-    // Display battery percentage
-    M5.Lcd.setCursor(250, 10);
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.setTextColor(themePrimaryColor);
-    M5.Lcd.printf("Battery: %d%%", batteryLevel);
-
-    // Display charging status
-    if (isCharging) {
-        M5.Lcd.setCursor(250, 30);
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setTextColor(THEME_GREEN);
-        M5.Lcd.println("Charging...");
-    }
-}
-
-// Function to handle graceful degradation
-void gracefulDegradation() {
-    // Reduce system load by disabling non-critical features
-    M5.Lcd.setTextSize(1);  // Reduce text size to save memory
-    Serial.println("System is degrading gracefully...");
-}
-
-// Function to handle errors with retries
-void errorHandler(const String &errorMsg, int retries) {
-    Serial.println("Error: " + errorMsg);
-    if (retries > 0) {
-        Serial.println("Retrying...");
-        delay(1000);
-        errorHandler(errorMsg, retries - 1);
-    } else {
-        Serial.println("Error handling failed after retries.");
-        M5.Lcd.clear();
-        M5.Lcd.setCursor(10, 10);
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setTextColor(THEME_RED);
-        M5.Lcd.println("Critical error encountered!");
-        delay(3000);
-        M5.reset();  // Reset the device after critical error
-    }
-}
-
-// Function to execute firmware with fallback
+// Firmware Execution with Escape Back to List
 void executeFirmware(const String &firmwareName) {
     String firmwarePath = String(firmwareDir) + firmwareName + ".bin";
     File firmwareFile = SD.open(firmwarePath, FILE_READ);
@@ -210,89 +229,119 @@ void executeFirmware(const String &firmwareName) {
         return;
     }
 
-    void* firmwareMemory = memoryAllocate(firmwareFile.size());
-    if (firmwareMemory == nullptr) {
-        errorHandler("Failed to allocate memory.");
-        firmwareFile.close();
+    size_t firmwareSize = firmwareFile.size();
+    SmartPointer<uint8_t> firmwareMemory(static_cast<uint8_t*>(hybridMemoryAllocate(firmwareSize)));
+    registerPointerReference(reinterpret_cast<void**>(&firmwareMemory));
+
+    firmwareFile.read(firmwareMemory.get(), firmwareSize);
+    firmwareFile.close();
+
+    if (firmwareSize > M5.getFreeHeap()) {
+        errorHandler("Not enough memory to run firmware.");
         return;
     }
 
-    firmwareFile.read((uint8_t*)firmwareMemory, firmwareFile.size());
-    firmwareFile.close();
+    void (*firmwareEntryPoint)() = (void (*)())firmwareMemory.get();
+    firmwareEntryPoint();
 
-    if (firmwareFile.size() > M5.getFreeHeap()) {
-        fallbackFirmwareExecution(firmwareName);  // Use fallback if memory is too low
-    } else {
-        void (*firmwareEntryPoint)() = (void (*)())firmwareMemory;
-        firmwareEntryPoint();  // Execute the firmware
+    listInstalledFirmware();
+}
+
+// Installed Firmware Menu
+void displayInstalledFirmwareMenu() {
+    int selectedIndex = 0;
+
+    while (true) {
+        M5.Lcd.clear();
+        M5.Lcd.setTextSize(2);
+        for (size_t i = 0; i < installedFirmware.size(); ++i) {
+            if (i == selectedIndex) {
+                M5.Lcd.setTextColor(themePrimaryColor, TFT_BLACK);
+            } else {
+                M5.Lcd.setTextColor(themeSecondaryColor, TFT_BLACK);
+            }
+            M5.Lcd.setCursor(10, 10 + i * 30);
+            M5.Lcd.printf("Name: %s\n", installedFirmware[i].name.c_str());
+        }
+
+        debounceButtons();  // Debouncing Button Inputs
+        if (M5.BtnA.wasPressed()) {
+            selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : installedFirmware.size() - 1;
+        } else if (M5.BtnC.wasPressed()) {
+            selectedIndex = (selectedIndex + 1) % installedFirmware.size();
+        } else if (M5.BtnB.wasPressed()) {
+            executeFirmware(installedFirmware[selectedIndex].name);
+            break;
+        } else if (M5.BtnB.pressedFor(1000)) {
+            break;
+        }
+
+        delay(100);
     }
 
-    memoryFree(firmwareMemory);
-}
-
-// Fallback firmware execution logic
-void fallbackFirmwareExecution(const String &firmwareName) {
-    Serial.println("Executing fallback for firmware: " + firmwareName);
-    // Implement logic to load a minimal or previous stable version
-}
-
-// Breadcrumbs navigation in file explorer
-void breadcrumbsNav(String path) {
-    String crumbs = "";
-    int pos = 0;
-    while ((pos = path.indexOf('/', pos)) != -1) {
-        crumbs += path.substring(0, pos + 1) + " > ";
-        pos++;
-    }
-    M5.Lcd.setTextColor(THEME_LIGHT_BLUE);
-    M5.Lcd.println(crumbs + path.substring(pos));
-}
-
-// Function to monitor system health
-void checkSystemHealth() {
-    if (M5.getFreeHeap() < 5000) {  // Example threshold for low memory
-        gracefulDegradation();
-    }
-}
-
-// Function to reset watchdog timer
-void resetWatchdog() {
-    esp_task_wdt_reset();  // Reset watchdog timer to prevent timeout
-}
-
-// Function to implement heartbeat for long-running tasks
-void heartbeatCheck() {
-    static unsigned long lastHeartbeat = 0;
-    if (millis() - lastHeartbeat > 1000) {
-        resetWatchdog();
-        lastHeartbeat = millis();
-    }
-}
-
-// Other functions (like the main menu, battery display, file explorer, etc.) would be implemented here following the same principles.
-
-// Main setup function
-void setup() {
-    initializeSystem();
-
-    // Display the startup intro with the custom message
-    displayStartupIntro();
-
-    // Connect to WiFi
-    connectWiFi();
-
-    // Download the initial firmware list from the server
-    downloadFirmwareList();
-
-    // Enter the main menu
     mainMenu();
 }
 
-// Loop function to monitor system health and watchdog reset
-void loop() {
-    checkSystemHealth();  // Continuously monitor system health
-    heartbeatCheck();     // Ensure long-running tasks reset the watchdog
-    // Main loop remains empty as the logic is managed in the mainMenu
+// Main Menu
+void mainMenu() {
+    fadeIn();
+    while (true) {
+        M5.Lcd.clear();
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.setTextColor(themePrimaryColor);
+        M5.Lcd.println("M5 OS Main Menu");
+        M5.Lcd.setCursor(10, 40);
+        M5.Lcd.println("A: List Installed Firmware");
+        M5.Lcd.setCursor(10, 70);
+        M5.Lcd.println("B: Download New Firmware");
+        M5.Lcd.setCursor(10, 100);
+        M5.Lcd.println("C: Refresh Firmware List");
+        M5.Lcd.setCursor(10, 130);
+        M5.Lcd.println("D: File Explorer");
+        M5.Lcd.setCursor(10, 160);
+        M5.Lcd.println("E: Theme Switch");
+
+        // Handle button presses for main menu options
+        debounceButtons();  // Debouncing button inputs
+        if (M5.BtnA.wasPressed()) {
+            fadeOut();
+            listInstalledFirmware();  // List and select installed firmware
+        } else if (M5.BtnB.wasPressed()) {
+            fadeOut();
+            displayAvailableFirmware();  // Display and download new firmware
+        } else if (M5.BtnC.wasPressed()) {
+            fadeOut();
+            downloadFirmwareList();  // Refresh firmware list from the server
+            fadeIn();
+            M5.Lcd.clear();
+            M5.Lcd.setCursor(10, 10);
+            M5.Lcd.setTextSize(2);
+            M5.Lcd.setTextColor(themePrimaryColor);
+            M5.Lcd.println("Firmware list refreshed.");
+            delay(2000);
+        } else if (M5.BtnD.wasPressed()) {
+            fadeOut();
+            displayFileExplorer("/");  // Launch the file explorer starting from the root directory
+        } else if (M5.BtnE.wasPressed()) {
+            fadeOut();
+            themeSwitchMenu();  // Open the theme switch menu
+        }
+
+        delay(100);  // Small delay to debounce button presses
+    }
+}
+
+// Function to debounce buttons
+void debounceButtons() {
+    static uint32_t lastDebounceTime = 0;
+    static const uint32_t debounceDelay = 50;
+
+    uint32_t currentTime = millis();
+    if (currentTime - lastDebounceTime > debounceDelay) {
+        lastDebounceTime = currentTime;
+        M5.update();
+    }
 }
 
 // Function to display available firmware for download
@@ -319,7 +368,7 @@ void displayAvailableFirmware() {
         }
 
         // Handle button presses for navigation (A = up, C = down, B = select/download)
-        M5.update();
+        debounceButtons();
         if (M5.BtnA.wasPressed()) {
             selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : availableFirmware.size() - 1;
         } else if (M5.BtnC.wasPressed()) {
@@ -350,17 +399,47 @@ void displayAvailableFirmware() {
     }
 }
 
+// Function to download and install firmware
+bool downloadAndInstallFirmware(const FirmwareInfo &info) {
+    HTTPClient http;
+    http.begin(info.url);
+    int httpCode = http.GET();
+
+    if (httpCode == HTTP_CODE_OK) {
+        int len = http.getSize();
+        SmartPointer<uint8_t> firmwareData(static_cast<uint8_t*>(hybridMemoryAllocate(len)));
+        registerPointerReference(reinterpret_cast<void**>(&firmwareData));
+
+        WiFiClient *stream = http.getStreamPtr();
+        int totalRead = 0;
+        while (http.connected() && (len > 0 || len == -1)) {
+            size_t size = stream->available();
+            if (size) {
+                int c = stream->readBytes(&firmwareData[totalRead], size);
+                totalRead += c;
+                len -= c;
+            }
+            delay(1);
+        }
+        http.end();
+
+        if (totalRead > 0) {
+            File firmwareFile = SD.open(firmwareDir + info.name + ".bin", FILE_WRITE);
+            if (firmwareFile) {
+                firmwareFile.write(firmwareData.get(), totalRead);
+                firmwareFile.close();
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 // Function to list installed firmware on the SD card
 void listInstalledFirmware() {
     File dir = SD.open(firmwareDir);
 
     if (!dir) {
-        M5.Lcd.clear();
-        M5.Lcd.setCursor(10, 10);
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setTextColor(themeSecondaryColor);
-        M5.Lcd.println("Failed to open firmware directory.");
-        delay(2000);
         return;
     }
 
@@ -394,212 +473,10 @@ void listInstalledFirmware() {
         return;
     }
 
-    int selectedIndex = 0;
-
-    // Display the list of firmware
-    while (true) {
-        M5.Lcd.clear();
-        M5.Lcd.setTextSize(2);
-        for (size_t i = 0; i < installedFirmware.size(); ++i) {
-            if (i == selectedIndex) {
-                M5.Lcd.setTextColor(themePrimaryColor, TFT_BLACK);  // Highlight selected item
-            } else {
-                M5.Lcd.setTextColor(themeSecondaryColor, TFT_BLACK);
-            }
-            M5.Lcd.setCursor(10, 10 + i * 30);
-            M5.Lcd.printf("Name: %s\n", installedFirmware[i].name.c_str());
-        }
-
-        // Handle button presses for navigation (A = up, C = down, B = select)
-        M5.update();
-        if (M5.BtnA.wasPressed()) {
-            selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : installedFirmware.size() - 1;
-        } else if (M5.BtnC.wasPressed()) {
-            selectedIndex = (selectedIndex + 1) % installedFirmware.size();
-        } else if (M5.BtnB.wasPressed()) {
-            fadeOut();
-            executeFirmware(installedFirmware[selectedIndex].name);
-            break;  // After execution, break to return to main menu
-        }
-
-        delay(100);  // Small delay to debounce button presses
-    }
+    displayInstalledFirmwareMenu();
 }
 
-// Advanced file explorer with breadcrumbs navigation
-void displayFileExplorer(const char* path) {
-    File dir = SD.open(path);
-
-    if (!dir) {
-        M5.Lcd.clear();
-        M5.Lcd.setCursor(10, 10);
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setTextColor(themeSecondaryColor);
-        M5.Lcd.println("Failed to open directory.");
-        delay(2000);
-        return;
-    }
-
-    std::vector<String> files;
-    while (true) {
-        File entry = dir.openNextFile();
-        if (!entry) {
-            break;  // No more files
-        }
-
-        if (!entry.isDirectory()) {
-            files.push_back(entry.name());
-        }
-        entry.close();
-    }
-
-    if (files.empty()) {
-        M5.Lcd.clear();
-        M5.Lcd.setCursor(10, 10);
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setTextColor(themeSecondaryColor);
-        M5.Lcd.println("No files found.");
-        delay(2000);
-        return;
-    }
-
-    int selectedIndex = 0;
-
-    // Display the list of files with breadcrumbs
-    while (true) {
-        M5.Lcd.clear();
-        M5.Lcd.setTextSize(2);
-        breadcrumbsNav(path);  // Display breadcrumbs
-        for (size_t i = 0; i < files.size(); ++i) {
-            if (i == selectedIndex) {
-                M5.Lcd.setTextColor(themePrimaryColor, TFT_BLACK);  // Highlight selected item
-            } else {
-                M5.Lcd.setTextColor(themeSecondaryColor, TFT_BLACK);
-            }
-            M5.Lcd.setCursor(10, 30 + i * 30);
-            M5.Lcd.printf("File: %s", files[i].c_str());
-        }
-
-        // Handle button presses for navigation (A = up, C = down, B = select)
-        M5.update();
-        if (M5.BtnA.wasPressed()) {
-            selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : files.size() - 1;
-        } else if (M5.BtnC.wasPressed()) {
-            selectedIndex = (selectedIndex + 1) % files.size();
-        } else if (M5.BtnB.wasPressed()) {
-            // Show file details or perform operations (e.g., delete)
-            String selectedFile = files[selectedIndex];
-            M5.Lcd.clear();
-            M5.Lcd.setCursor(10, 10);
-            M5.Lcd.setTextSize(2);
-            M5.Lcd.setTextColor(themePrimaryColor);
-            M5.Lcd.printf("Selected: %s", selectedFile.c_str());
-
-            // Example: Option to delete the file
-            M5.Lcd.setCursor(10, 40);
-            M5.Lcd.println("Press B to delete");
-            M5.Lcd.println("Press A to go back");
-
-            bool fileActionDone = false;
-            while (!fileActionDone) {
-                M5.update();
-                if (M5.BtnA.wasPressed()) {
-                    fileActionDone = true;  // Go back to file list
-                } else if (M5.BtnB.wasPressed()) {
-                    if (SD.remove(selectedFile)) {
-                        M5.Lcd.setCursor(10, 70);
-                        M5.Lcd.setTextColor(themeSecondaryColor);
-                        M5.Lcd.println("File deleted.");
-                    } else {
-                        M5.Lcd.setCursor(10, 70);
-                        M5.Lcd.setTextColor(themeSecondaryColor);
-                        M5.Lcd.println("Failed to delete file.");
-                    }
-                    delay(2000);
-
-                    fileActionDone = true;  // Go back to file list
-                }
-            }
-
-            // Refresh file list after action
-            displayFileExplorer(path);
-            break;
-        }
-
-        delay(100);  // Small delay to debounce button presses
-    }
-}
-
-// Function to switch themes with UI
-void themeSwitchMenu() {
-    int selectedTheme = 0;
-    String themes[] = {"Light Blue", "Green", "Orange", "White"};
-    
-    while (true) {
-        M5.Lcd.clear();
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setTextColor(themePrimaryColor);
-        M5.Lcd.setCursor(10, 10);
-        M5.Lcd.println("Select Theme:");
-
-        for (int i = 0; i < 4; i++) {
-            if (i == selectedTheme) {
-                M5.Lcd.setTextColor(themeSecondaryColor, TFT_BLACK);  // Highlight selected item
-            } else {
-                M5.Lcd.setTextColor(themePrimaryColor, TFT_BLACK);
-            }
-            M5.Lcd.setCursor(10, 50 + i * 30);
-            M5.Lcd.printf("%s", themes[i].c_str());
-        }
-
-        M5.update();
-        if (M5.BtnA.wasPressed()) {
-            selectedTheme = (selectedTheme > 0) ? selectedTheme - 1 : 3;
-        } else if (M5.BtnC.wasPressed()) {
-            selectedTheme = (selectedTheme + 1) % 4;
-        } else if (M5.BtnB.wasPressed()) {
-            switchTheme(selectedTheme + 1);  // Switch theme based on selection
-            fadeOut();
-            fadeIn();
-        } else if (M5.BtnA.pressedFor(1000)) {
-            // Exit the theme switch menu and return to the main menu
-            fadeOut();
-            mainMenu();
-            break;
-        }
-
-        delay(100);  // Small delay to debounce button presses
-    }
-}
-
-// Function to switch themes based on selection
-void switchTheme(uint8_t theme) {
-    switch (theme) {
-        case 1:
-            themePrimaryColor = THEME_LIGHT_BLUE;
-            themeSecondaryColor = THEME_DARK_BLUE;
-            break;
-        case 2:
-            themePrimaryColor = THEME_GREEN;
-            themeSecondaryColor = THEME_DARK_BLUE;
-            break;
-        case 3:
-            themePrimaryColor = THEME_ORANGE;
-            themeSecondaryColor = THEME_DARK_BLUE;
-            break;
-        case 4:
-            themePrimaryColor = THEME_WHITE;
-            themeSecondaryColor = THEME_DARK_BLUE;
-            break;
-        default:
-            themePrimaryColor = THEME_LIGHT_BLUE;
-            themeSecondaryColor = THEME_DARK_BLUE;
-            break;
-    }
-    M5.Lcd.setTextColor(themePrimaryColor, TFT_BLACK);
-}
-
-// Function to input password using the M5Stack buttons
+// WiFi password input using M5Stack buttons
 void inputPassword() {
     char passwordBuffer[32] = "";
     int length = 0;
@@ -622,8 +499,7 @@ void inputPassword() {
         M5.Lcd.setTextColor(themePrimaryColor);
         M5.Lcd.printf("Char: %c", charMap[charIndex]);
 
-        M5.update();
-
+        debounceButtons();
         if (M5.BtnA.wasPressed()) {
             charIndex = (charIndex > 0) ? charIndex - 1 : mapSize - 1;
         } else if (M5.BtnC.wasPressed()) {
@@ -650,7 +526,7 @@ void inputPassword() {
     }
 }
 
-// Function to select WiFi network and connect
+// WiFi selection and connection with password input
 void selectWiFiNetwork() {
     M5.Lcd.clear();
     M5.Lcd.setTextSize(2);
@@ -680,123 +556,150 @@ void selectWiFiNetwork() {
             M5.Lcd.printf("%s (%d)", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
         }
 
-        M5.update();
+        debounceButtons();
         if (M5.BtnA.wasPressed()) {
             selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : numNetworks - 1;
         } else if (M5.BtnC.wasPressed()) {
             selectedIndex = (selectedIndex + 1) % numNetworks;
         } else if (M5.BtnB.wasPressed()) {
             strcpy(wifiSSID, WiFi.SSID(selectedIndex).c_str());  // Store the selected SSID
-            M5.Lcd.clear();
-            M5.Lcd.setCursor(10, 10);
-            M5.Lcd.setTextSize(2);
-            M5.Lcd.setTextColor(themePrimaryColor);
-            M5.Lcd.println("Selected:");
-            M5.Lcd.setCursor(10, 40);
-            M5.Lcd.println(wifiSSID);
-            delay(2000);
+            inputPassword();  // Prompt the user to enter the WiFi password
+            connectWiFi();  // Attempt to connect using the selected SSID and password
             break;
         }
 
         delay(100);  // Small delay to debounce button presses
     }
-    inputPassword();  // Proceed to password input after selecting SSID
 }
 
-// Function to connect to WiFi with user-selected credentials with error handling
+// WiFi connection function
 void connectWiFi() {
-    selectWiFiNetwork();  // Allow user to select a WiFi network
-
     WiFi.begin(wifiSSID, wifiPassword);
-    M5.Lcd.clear();
-    M5.Lcd.setCursor(10, 10);
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.setTextColor(themePrimaryColor);
-    M5.Lcd.println("Connecting to WiFi...");
-    Serial.print("Connecting to WiFi...");
-    int retryCount = 0;
 
-    while (WiFi.status() != WL_CONNECTED) {
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 10) {
         delay(1000);
-        Serial.print(".");
         M5.Lcd.print(".");
-
-        if (++retryCount > 10) {  // If unable to connect after 10 seconds, show an error
-            M5.Lcd.clear();
-            M5.Lcd.setCursor(10, 10);
-            M5.Lcd.setTextSize(2);
-            M5.Lcd.setTextColor(themeSecondaryColor);
-            M5.Lcd.println("Failed to connect to WiFi.");
-            delay(2000);
-            return;  // Return to main menu or allow retry
-        }
+        retries++;
     }
 
-    Serial.println("Connected to WiFi");
+    if (WiFi.status() != WL_CONNECTED) {
+        M5.Lcd.clear();
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setTextColor(themeSecondaryColor);
+        M5.Lcd.println("Failed to connect to WiFi.");
+        delay(2000);
+    } else {
+        M5.Lcd.clear();
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setTextColor(themePrimaryColor);
+        M5.Lcd.println("WiFi Connected!");
+        delay(2000);
+    }
+}
+
+// Display the startup intro
+void displayStartupIntro() {
+    fadeIn();
     M5.Lcd.clear();
     M5.Lcd.setCursor(10, 10);
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.setTextColor(themePrimaryColor);
-    M5.Lcd.println("WiFi Connected!");
-    delay(2000);
+    M5.Lcd.setTextSize(5);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.println("M5 OS");
+    displayCustomMessage();
+    fadeOut();
 }
 
-// Main menu function
-void mainMenu() {
-    fadeIn();
-    while (true) {
-        M5.Lcd.clear();
-        M5.Lcd.setTextSize(2);
-        M5.Lcd.setCursor(10, 10);
-        M5.Lcd.setTextColor(themePrimaryColor);
-        M5.Lcd.println("M5 OS Main Menu");
-        M5.Lcd.setCursor(10, 40);
-        M5.Lcd.println("A: List Installed Firmware");
-        M5.Lcd.setCursor(10, 70);
-        M5.Lcd.println("B: Download New Firmware");
-        M5.Lcd.setCursor(10, 100);
-        M5.Lcd.println("C: Refresh Firmware List");
-        M5.Lcd.setCursor(10, 130);
+// Display a custom message after the startup animation
+void displayCustomMessage() {
+    M5.Lcd.clear();
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.setTextSize(3);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.println("Welcome to M5 OS");
+    M5.Lcd.setCursor(10, 50);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.println("System by Salavadordata");
 
-        M5.Lcd.println("C: Refresh Firmware List");
-        M5.Lcd.setCursor(10, 130);
-        M5.Lcd.println("D: File Explorer");
-        M5.Lcd.setCursor(10, 160);
-        M5.Lcd.println("E: Theme Switch");
+    delay(2300);  // Display the message for 2.3 seconds
+}
 
-        // Handle button presses for main menu options (A = Installed Firmware, B = Download Firmware, C = Refresh, D = File Explorer, E = Theme Switch)
-        M5.update();
-        if (M5.BtnA.wasPressed()) {
-            fadeOut();
-            listInstalledFirmware();  // List and select installed firmware
-        } else if (M5.BtnB.wasPressed()) {
-            fadeOut();
-            downloadFirmwareList();   // Download the list of available firmware
-            displayAvailableFirmware();  // Display and download new firmware
-
-        } else if (M5.BtnC.wasPressed()) {
-            fadeOut();
-            downloadFirmwareList();  // Refresh firmware list from the server
-            fadeIn();
-            M5.Lcd.clear();
-            M5.Lcd.setCursor(10, 10);
-            M5.Lcd.setTextSize(2);
-            M5.Lcd.setTextColor(themePrimaryColor);
-            M5.Lcd.println("Firmware list refreshed.");
-            delay(2000);
-        } else if (M5.BtnD.wasPressed()) {
-            fadeOut();
-            displayFileExplorer("/");  // Launch the file explorer starting from the root directory
-        } else if (M5.BtnE.wasPressed()) {
-            fadeOut();
-            themeSwitchMenu();  // Open the theme switch menu
-        }
-
-        delay(100);  // Small delay to debounce button presses
+// Fade-in effect for smoother UI transitions
+void fadeIn() {
+    for (int brightness = 0; brightness < 255; brightness += 5) {
+        M5.Lcd.setBrightness(brightness);
+        delay(10);
     }
 }
 
-// Setup function to initialize everything
+// Fade-out effect for smoother UI transitions
+void fadeOut() {
+    for (int brightness = 255; brightness > 0; brightness -= 5) {
+        M5.Lcd.setBrightness(brightness);
+        delay(10);
+    }
+}
+
+// Monitor system health and trigger low power mode when idle
+void monitorIdleState() {
+    static unsigned long lastActiveTime = 0;
+    unsigned long currentTime = millis();
+
+    if (M5.BtnA.isPressed() || M5.BtnB.isPressed() || M5.BtnC.isPressed()) {
+        lastActiveTime = currentTime;  // Reset timer on any button press
+    }
+
+    if (currentTime - lastActiveTime > 10000) {
+        enterLowPowerMode();
+    }
+}
+
+// Enter low power mode to save battery
+void enterLowPowerMode() {
+    M5.Power.deepSleep(0);  // Enter deep sleep mode
+}
+
+// System health check to manage system resources
+void checkSystemHealth() {
+    static unsigned long lastHealthCheck = 0;
+    unsigned long currentTime = millis();
+
+    if (currentTime - lastHealthCheck > 1000) {
+        lastHealthCheck = currentTime;
+
+        if (M5.getFreeHeap() < 5000) {  // Example threshold for low memory
+            errorHandler("Low memory detected", 3);
+        }
+    }
+}
+
+// Heartbeat to reset the watchdog timer periodically
+void heartbeatCheck() {
+    static Ticker heartbeat;
+    heartbeat.attach(1, []() {
+        esp_task_wdt_reset();  // Reset watchdog timer to prevent timeout
+    });
+}
+
+// Error handler function
+void errorHandler(const String &errorMsg, int retries) {
+    if (retries > 0) {
+        delay(500);
+        errorHandler(errorMsg, retries - 1);
+    } else {
+        M5.Lcd.clear();
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setTextColor(TFT_RED);
+        M5.Lcd.println("Critical error!");
+        delay(1000);  // Short delay before resetting
+        M5.reset();
+    }
+}
+
+// Initialize the system
 void setup() {
     initializeSystem();
 
@@ -813,7 +716,10 @@ void setup() {
     mainMenu();
 }
 
-// Loop function (not used)
+// Main loop to monitor system health and idle state
 void loop() {
-    // Empty loop as the main logic is in the mainMenu
+    taskScheduler.execute();  // Run scheduled tasks like health checks, idle monitoring, etc.
+    monitorIdleState();  // Check for idle state and enter low power mode if necessary
+    checkSystemHealth();  // Continuously monitor system health
+    heartbeatCheck();     // Reset the watchdog to prevent system reset
 }
