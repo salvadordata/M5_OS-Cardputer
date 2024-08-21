@@ -1,17 +1,17 @@
-#include <M5Stack.h>
-#include <WiFi.h>
-#include <HTTPClient.h>
-#include <SD.h>
-#include <SPI.h>
-#include <ArduinoJson.h>
-#include <esp_task_wdt.h>
-#include <EEPROM.h>
-#include <Update.h>
-#include <avr/pgmspace.h>
-#include <Ticker.h>
-#include <TaskScheduler.h>
-#include <vector>
-#include <map>
+#include"M5Stack.h"
+#include "WiFi.h"
+#include "HTTPClient.h"
+#include "SD.h"
+#include "SPI.h"
+#include "ArduinoJson.h"
+#include "esp_task_wdt.h"
+#include "EEPROM.h"
+#include "Update.h"
+#include "avr/pgmspace.h"
+#include "Ticker.h"
+#include "TaskScheduler.h"
+#include "vector"
+#include "map"
 
 // Constants and Variables
 const char* firmwareDir = "/firmware/";
