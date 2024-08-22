@@ -1,17 +1,18 @@
-#include"M5Stack.h"
-#include "WiFi.h"
-#include "HTTPClient.h"
-#include "SD.h"
-#include "SPI.h"
-#include "ArduinoJson.h"
-#include "esp_task_wdt.h"
-#include "EEPROM.h"
-#include "Update.h"
-#include "avr/pgmspace.h"
-#include "Ticker.h"
-#include "TaskScheduler.h"
-#include "vector"
-#include "map"
+#include <M5Stack.h>
+#include <WiFi.h>
+#include <HTTPClient.h>
+#include <SD.h>
+#include <SPI.h>
+#include <ArduinoJson.h>
+#include <esp_task_wdt.h>
+#include <EEPROM.h>
+#include <Update.h>
+#include <avr/pgmspace.h>
+#include <AvrHeap.h>
+#include <Ticker.h>
+#include <TaskScheduler.h>
+#include <vector>
+#include <map>
 
 // Constants and Variables
 const char* firmwareDir = "/firmware/";
@@ -24,10 +25,11 @@ std::vector<FirmwareInfo> installedFirmware;
 #define POOL_SIZE 1024
 #define LARGE_ALLOCATION_THRESHOLD 128
 
+AvrHeap avrHeap(POOL_SIZE);
 char memoryPool[POOL_SIZE];
 bool memoryPoolAllocated[POOL_SIZE / SMALL_BLOCK_SIZE];
 std::vector<void**> pointerReferences;
-std::map<void*, bool> memoryMap;  // Tracks if memory is in use or not
+std::map<void*, bool> memoryMap;
 
 char wifiSSID[32];
 char wifiPassword[32] = "";
@@ -85,7 +87,7 @@ private:
 
 public:
     explicit SmartPointer(T* p = nullptr) : ptr(p), refCount(new size_t(1)) {
-        memoryMap[ptr] = true; // Mark this memory as in-use
+        memoryMap[ptr] = true;
     }
     SmartPointer(const SmartPointer& sp) : ptr(sp.ptr), refCount(sp.refCount) {
         (*refCount)++;
@@ -116,7 +118,7 @@ public:
     }
     void release() {
         if (--(*refCount) == 0) {
-            memoryMap[ptr] = false; // Mark memory as no longer in use
+            memoryMap[ptr] = false;
             delete[] ptr;
             delete refCount;
         }
@@ -147,7 +149,7 @@ void* hybridMemoryAllocate(size_t size) {
         memoryCompaction();
         return hybridMemoryAllocate(size);
     } else if (size > LARGE_ALLOCATION_THRESHOLD) {
-        return heap_caps_malloc(size, MALLOC_CAP_8BIT);
+        return avrHeap.malloc(size);
     } else {
         return malloc(size);
     }
@@ -193,7 +195,6 @@ void memoryCompaction() {
     }
 }
 
-// Run the garbage collector to free unused memory
 void runGarbageCollector() {
     for (auto it = memoryMap.begin(); it != memoryMap.end(); ) {
         if (!it->second) {
@@ -270,7 +271,7 @@ void displayInstalledFirmwareMenu() {
         } else if (M5.BtnB.wasPressed()) {
             executeFirmware(installedFirmware[selectedIndex].name);
             break;
-        } else if (M5.BtnB.pressedFor(1000)) {  // Long press to escape
+        } else if (M5.BtnB.pressedFor(1000)) {
             break;
         }
 
@@ -287,7 +288,6 @@ void mainMenu() {
         M5.Lcd.clear();
         M5.Lcd.setTextSize(2);
         M5.Lcd.setCursor(10, 10);
-        M5.Lcd.setTextSize(2);
         M5.Lcd.setTextColor(themePrimaryColor);
         M5.Lcd.println("M5 OS Main Menu");
         M5.Lcd.setCursor(10, 40);
@@ -526,198 +526,208 @@ void inputPassword() {
 
 // WiFi selection and connection with password input
 void selectWiFiNetwork() {
+    M5.Lcd.clear();
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setTextColor(themePrimaryColor);
+    M5.Lcd.println("Scanning for WiFi networks...");
+    int numNetworks = WiFi.scanNetworks();
+    if (numThe continuation of the integrated M5 OS code:
+
+```cpp
+// WiFi selection and connection with password input
+void selectWiFiNetwork() {
+    M5.Lcd.clear();
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.setTextColor(themePrimaryColor);
+    M5.Lcd.println("Scanning for WiFi networks...");
+    int numNetworks = WiFi.scanNetworks();
+    if (numNetworks == 0) {
         M5.Lcd.clear();
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setTextColor(themeSecondaryColor);
+        M5.Lcd.println("No WiFi networks found.");
+        delay(2000);
+        return;
+    }
+
+    int selectedIndex = 0;
+    while (true) {
+        M5.Lcd.clear();
+        for (int i = 0; i < numNetworks; ++i) {
+            if (i == selectedIndex) {
+                M5.Lcd.setTextColor(themeSecondaryColor, TFT_BLACK);  // Highlight selected item
+            } else {
+                M5.Lcd.setTextColor(themePrimaryColor, TFT_BLACK);
+            }
+            M5.Lcd.setCursor(10, 10 + i * 20);
+            M5.Lcd.printf("%s (%d)", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
+        }
+
+        debounceButtons();
+        if (M5.BtnA.wasPressed()) {
+            selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : numNetworks - 1;
+        } else if (M5.BtnC.wasPressed()) {
+            selectedIndex = (selectedIndex + 1) % numNetworks;
+        } else if (M5.BtnB.wasPressed()) {
+            strcpy(wifiSSID, WiFi.SSID(selectedIndex).c_str());  // Store the selected SSID
+            inputPassword();  // Prompt the user to enter the WiFi password
+            connectWiFi();  // Attempt to connect using the selected SSID and password
+            break;
+        }
+
+        delay(100);  // Small delay to debounce button presses
+    }
+}
+
+// WiFi connection function
+void connectWiFi() {
+    WiFi.begin(wifiSSID, wifiPassword);
+
+    int retries = 0;
+    while (WiFi.status() != WL_CONNECTED && retries < 10) {
+        delay(1000);
+        M5.Lcd.print(".");
+        retries++;
+    }
+
+    if (WiFi.status() != WL_CONNECTED) {
+        M5.Lcd.clear();
+        M5.Lcd.setCursor(10, 10);
+        M5.Lcd.setTextSize(2);
+        M5.Lcd.setTextColor(themeSecondaryColor);
+        M5.Lcd.println("Failed to connect to WiFi.");
+        delay(2000);
+    } else {
+        M5.Lcd.clear();
+        M5.Lcd.setCursor(10, 10);
         M5.Lcd.setTextSize(2);
         M5.Lcd.setTextColor(themePrimaryColor);
-        M5.Lcd.println("Scanning for WiFi networks...");
-        int numNetworks = WiFi.scanNetworks();
-        if (numNetworks == 0) {
-            M5.Lcd.clear();
-            M5.Lcd.setCursor(10, 10);
-            M5.Lcd.setTextSize(2);
-            M5.Lcd.setTextColor(themeSecondaryColor);
-            M5.Lcd.println("No WiFi networks found.");
-            delay(2000);
-            return;
-        }
+        M5.Lcd.println("WiFi Connected!");
+        delay(2000);
+    }
+}
 
-        int selectedIndex = 0;
-        while (true) {
-            M5.Lcd.clear();
-            for (int i = 0; i < numNetworks; ++i) {
-                if (i == selectedIndex) {
-                    M5.Lcd.setTextColor(themeSecondaryColor, TFT_BLACK);  // Highlight selected item
-                } else {
-                    M5.Lcd.setTextColor(themePrimaryColor, TFT_BLACK);
-                }
-                M5.Lcd.setCursor(10, 10 + i * 20);
-                M5.Lcd.printf("%s (%d)", WiFi.SSID(i).c_str(), WiFi.RSSI(i));
-            }
+// Display the startup intro
+void displayStartupIntro() {
+    fadeIn();
+    M5.Lcd.clear();
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.setTextSize(5);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.println("M5 OS");
+    displayCustomMessage();
+    fadeOut();
+}
 
-            debounceButtons();
-            if (M5.BtnA.wasPressed()) {
-                selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : numNetworks - 1;
-            } else if (M5.BtnC.wasPressed()) {
-                selectedIndex = (selectedIndex + 1) % numNetworks;
-            } else if (M5.BtnB.wasPressed()) {
-                strcpy(wifiSSID, WiFi.SSID(selectedIndex).c_str());  // Store the selected SSID
-                inputPassword();  // Prompt the user to enter the WiFi password
-                connectWiFi();  // Attempt to connect using the selected SSID and password
-                break;
-            }
+// Display a custom message after the startup animation
+void displayCustomMessage() {
+    M5.Lcd.clear();
+    M5.Lcd.setCursor(10, 10);
+    M5.Lcd.setTextSize(3);
+    M5.Lcd.setTextColor(TFT_WHITE);
+    M5.Lcd.println("Welcome to M5 OS");
+    M5.Lcd.setCursor(10, 50);
+    M5.Lcd.setTextSize(2);
+    M5.Lcd.println("System by Salavadordata");
 
-            delay(100);  // Small delay to debounce button presses
-        }
+    delay(2300);  // Display the message for 2.3 seconds
+}
+
+// Fade-in effect for smoother UI transitions
+void fadeIn() {
+    for (int brightness = 0; brightness < 255; brightness += 5) {
+        M5.Lcd.setBrightness(brightness);
+        delay(10);
+    }
+}
+
+// Fade-out effect for smoother UI transitions
+void fadeOut() {
+    for (int brightness = 255; brightness > 0; brightness -= 5) {
+        M5.Lcd.setBrightness(brightness);
+        delay(10);
+    }
+}
+
+// Monitor system health and trigger low power mode when idle
+void monitorIdleState() {
+    static unsigned long lastActiveTime = 0;
+    unsigned long currentTime = millis();
+
+    if (M5.BtnA.isPressed() || M5.BtnB.isPressed() || M5.BtnC.isPressed()) {
+        lastActiveTime = currentTime;  // Reset timer on any button press
     }
 
-    // WiFi connection function
-    void connectWiFi() {
-        WiFi.begin(wifiSSID, wifiPassword);
+    if (currentTime - lastActiveTime > 10000) {
+        enterLowPowerMode();
+    }
+}
 
-        int retries = 0;
-        while (WiFi.status() != WL_CONNECTED && retries < 10) {
-            delay(1000);
-            M5.Lcd.print(".");
-            retries++;
-        }
+// Enter low power mode to save battery
+void enterLowPowerMode() {
+    M5.Power.deepSleep(0);  // Enter deep sleep mode
+}
 
-        if (WiFi.status() != WL_CONNECTED) {
-            M5.Lcd.clear();
-            M5.Lcd.setCursor(10, 10);
-            M5.Lcd.setTextSize(2);
-            M5.Lcd.setTextColor(themeSecondaryColor);
-            M5.Lcd.println("Failed to connect to WiFi.");
-            delay(2000);
-        } else {
-            M5.Lcd.clear();
-            M5.Lcd.setCursor(10, 10);
-            M5.Lcd.setTextSize(2);
-            M5.Lcd.setTextColor(themePrimaryColor);
-            M5.Lcd.println("WiFi Connected!");
-            delay(2000);
+// System health check to manage system resources
+void checkSystemHealth() {
+    static unsigned long lastHealthCheck = 0;
+    unsigned long currentTime = millis();
+
+    if (currentTime - lastHealthCheck > 1000) {
+        lastHealthCheck = currentTime;
+
+        if (M5.getFreeHeap() < 5000) {  // Example threshold for low memory
+            errorHandler("Low memory detected", 3);
         }
     }
+}
 
-    // Display the startup intro
-    void displayStartupIntro() {
-        fadeIn();
+// Heartbeat to reset the watchdog timer periodically
+void heartbeatCheck() {
+    static Ticker heartbeat;
+    heartbeat.attach(1, []() {
+        esp_task_wdt_reset();  // Reset watchdog timer to prevent timeout
+    });
+}
+
+// Error handler function
+void errorHandler(const String &errorMsg, int retries) {
+    if (retries > 0) {
+        delay(500);
+        errorHandler(errorMsg, retries - 1);
+    } else {
         M5.Lcd.clear();
         M5.Lcd.setCursor(10, 10);
-        M5.Lcd.setTextSize(5);
-        M5.Lcd.setTextColor(TFT_WHITE);
-        M5.Lcd.println("M5 OS");
-        displayCustomMessage();
-        fadeOut();
-    }
-
-    // Display a custom message after the startup animation
-    void displayCustomMessage() {
-        M5.Lcd.clear();
-        M5.Lcd.setCursor(10, 10);
-        M5.Lcd.setTextSize(3);
-        M5.Lcd.setTextColor(TFT_WHITE);
-        M5.Lcd.println("Welcome to M5 OS");
-        M5.Lcd.setCursor(10, 50);
         M5.Lcd.setTextSize(2);
-        M5.Lcd.println("System by Salavadordata");
-
-        delay(2300);  // Display the message for 2.3 seconds
+        M5.Lcd.setTextColor(TFT_RED);
+        M5.Lcd.println("Critical error!");
+        delay(1000);  // Short delay before resetting
+        M5.reset();
     }
+}
 
-    // Fade-in effect for smoother UI transitions
-    void fadeIn() {
-        for (int brightness = 0; brightness < 255; brightness += 5) {
-            M5.Lcd.setBrightness(brightness);
-            delay(10);
-        }
-    }
+// Initialize the system
+void setup() {
+    initializeSystem();
 
-    // Fade-out effect for smoother UI transitions
-    void fadeOut() {
-        for (int brightness = 255; brightness > 0; brightness -= 5) {
-            M5.Lcd.setBrightness(brightness);
-            delay(10);
-        }
-    }
+    // Display the startup intro with the custom message
+    displayStartupIntro();
 
-    // Monitor system health and trigger low power mode when idle
-    void monitorIdleState() {
-        static unsigned long lastActiveTime = 0;
-        unsigned long currentTime = millis();
+    // Connect to WiFi
+    connectWiFi();
 
-        if (M5.BtnA.isPressed() || M5.BtnB.isPressed() || M5.BtnC.isPressed()) {
-            lastActiveTime = currentTime;  // Reset timer on any button press
-        }
+    // Download the initial firmware list from the server
+    downloadFirmwareList();
 
-        if (currentTime - lastActiveTime > 10000) {
-            enterLowPowerMode();
-        }
-    }
+    // Enter the main menu
+    mainMenu();
+}
 
-    // Enter low power mode to save battery
-    void enterLowPowerMode() {
-        M5.Power.deepSleep(0);  // Enter deep sleep mode
-    }
-
-    // System health check to manage system resources
-    void checkSystemHealth() {
-        static unsigned long lastHealthCheck = 0;
-        unsigned long currentTime = millis();
-
-        if (currentTime - lastHealthCheck > 1000) {
-            lastHealthCheck = currentTime;
-
-            if (M5.getFreeHeap() < 5000) {  // Example threshold for low memory
-                errorHandler("Low memory detected", 3);
-            }
-        }
-    }
-
-    // Heartbeat to reset the watchdog timer periodically
-    void heartbeatCheck() {
-        static Ticker heartbeat;
-        heartbeat.attach(1, []() {
-            esp_task_wdt_reset();  // Reset watchdog timer to prevent timeout
-        });
-    }
-
-    // Error handler function
-    void errorHandler(const String &errorMsg, int retries) {
-        if (retries > 0) {
-            delay(500);
-            errorHandler(errorMsg, retries - 1);
-        } else {
-            M5.Lcd.clear();
-            M5.Lcd.setCursor(10, 10);
-            M5.Lcd.setTextSize(2);
-            M5.Lcd.setTextColor(TFT_RED);
-            M5.Lcd.println("Critical error!");
-            delay(1000);  // Short delay before resetting
-            M5.reset();
-        }
-    }
-
-    // Initialize the system
-    void setup() {
-        initializeSystem();
-
-        // Display the startup intro with the custom message
-        displayStartupIntro();
-
-        // Connect to WiFi
-        connectWiFi();
-
-        // Download the initial firmware list from the server
-        downloadFirmwareList();
-
-        // Enter the main menu
-        mainMenu();
-    }
-
-    // Main loop to monitor system health and idle state
-    void loop() {
-        taskScheduler.execute();  // Run scheduled tasks like health checks, idle monitoring, etc.
-        monitorIdleState();  // Check for idle state and enter low power mode if necessary
-        checkSystemHealth();  // Continuously monitor system health
-        heartbeatCheck();     // Reset the watchdog to prevent system reset
-    }
+// Main loop to monitor system health and idle state
+void loop() {
+    taskScheduler.execute();  // Run scheduled tasks like health checks, idle monitoring, etc.
+    monitorIdleState();  // Check for idle state and enter low power mode if necessary
+    checkSystemHealth();  // Continuously monitor system health
+    heartbeatCheck();     // Reset the watchdog to prevent system reset
+}
