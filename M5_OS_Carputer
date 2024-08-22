@@ -7,12 +7,11 @@
 #include <esp_task_wdt.h>
 #include <EEPROM.h>
 #include <Update.h>
-#include <avr/pgmspace.h>
-#include <AvrHeap.h>
 #include <Ticker.h>
 #include <TaskScheduler.h>
 #include <vector>
 #include <map>
+#include <pgmspace.h> // For storing icons in flash memory (PROGMEM)
 
 // Constants and Variables
 const char* firmwareDir = "/firmware/";
@@ -25,11 +24,10 @@ std::vector<FirmwareInfo> installedFirmware;
 #define POOL_SIZE 1024
 #define LARGE_ALLOCATION_THRESHOLD 128
 
-AvrHeap avrHeap(POOL_SIZE);
 char memoryPool[POOL_SIZE];
 bool memoryPoolAllocated[POOL_SIZE / SMALL_BLOCK_SIZE];
 std::vector<void**> pointerReferences;
-std::map<void*, bool> memoryMap;
+std::map<void*, bool> memoryMap;  // Tracks if memory is in use or not
 
 char wifiSSID[32];
 char wifiPassword[32] = "";
@@ -45,11 +43,28 @@ struct FirmwareInfo {
 
 // Task Scheduler for asynchronous operations
 Scheduler taskScheduler;
-Task WiFiTask(0, TASK_FOREVER, &connectWiFi, &taskScheduler, true);
+Task WiFiTask(0, TASK_FOREVER, &handleWiFiConnection, &taskScheduler, true);
 Task HealthCheckTask(1000, TASK_FOREVER, &checkSystemHealth, &taskScheduler, true);
 Task IdleMonitorTask(10000, TASK_FOREVER, &monitorIdleState, &taskScheduler, true);
 Task HeartbeatTask(1000, TASK_FOREVER, &heartbeatCheck, &taskScheduler, true);
 Task GarbageCollectorTask(5000, TASK_FOREVER, &runGarbageCollector, &taskScheduler, true);
+
+// Icons stored in PROGMEM
+const unsigned char firmwareIcon[] PROGMEM = {
+  // Icon data here...
+};
+
+const unsigned char downloadIcon[] PROGMEM = {
+  // Icon data here...
+};
+
+const unsigned char fileExplorerIcon[] PROGMEM = {
+  // Icon data here...
+};
+
+const unsigned char themeIcon[] PROGMEM = {
+  // Icon data here...
+};
 
 // Function Prototypes
 void initializeSystem();
@@ -87,7 +102,7 @@ private:
 
 public:
     explicit SmartPointer(T* p = nullptr) : ptr(p), refCount(new size_t(1)) {
-        memoryMap[ptr] = true;
+        memoryMap[ptr] = true; // Mark this memory as in-use
     }
     SmartPointer(const SmartPointer& sp) : ptr(sp.ptr), refCount(sp.refCount) {
         (*refCount)++;
@@ -118,7 +133,7 @@ public:
     }
     void release() {
         if (--(*refCount) == 0) {
-            memoryMap[ptr] = false;
+            memoryMap[ptr] = false; // Mark memory as no longer in use
             delete[] ptr;
             delete refCount;
         }
@@ -149,7 +164,7 @@ void* hybridMemoryAllocate(size_t size) {
         memoryCompaction();
         return hybridMemoryAllocate(size);
     } else if (size > LARGE_ALLOCATION_THRESHOLD) {
-        return avrHeap.malloc(size);
+        return heap_caps_malloc(size, MALLOC_CAP_8BIT);
     } else {
         return malloc(size);
     }
@@ -195,6 +210,7 @@ void memoryCompaction() {
     }
 }
 
+// Run the garbage collector to free unused memory
 void runGarbageCollector() {
     for (auto it = memoryMap.begin(); it != memoryMap.end(); ) {
         if (!it->second) {
@@ -209,6 +225,8 @@ void runGarbageCollector() {
 // System Initialization
 void initializeSystem() {
     M5.begin();
+    Serial.begin(115200);
+
     if (!SD.begin()) {
         errorHandler("SD card initialization failed!");
     }
@@ -261,20 +279,6 @@ void displayInstalledFirmwareMenu() {
             }
             M5.Lcd.setCursor(10, 10 + i * 30);
             M5.Lcd.printf("Name: %s\n", installedFirmware[i].name.c_str());
-        }
-
-        debounceButtons();  // Debouncing Button Inputs
-        if (M5.BtnA.wasPressed()) {
-            selectedIndex = (selectedIndex > 0) ? selectedIndex - 1 : installedFirmware.size() - 1;
-        } else if (M5.BtnC.wasPressed()) {
-            selectedIndex = (selectedIndex + 1) % installedFirmware.size();
-        } else if (M5.BtnB.wasPressed()) {
-            executeFirmware(installedFirmware[selectedIndex].name);
-            break;
-        } else if (M5.BtnB.pressedFor(1000)) {
-            break;
-        }
-
         delay(100);
     }
 
@@ -301,10 +305,11 @@ void mainMenu() {
         M5.Lcd.setCursor(10, 160);
         M5.Lcd.println("E: Theme Switch");
 
+        // Handle button presses for main menu options
         debounceButtons();  // Debouncing button inputs
         if (M5.BtnA.wasPressed()) {
             fadeOut();
-            displayInstalledFirmwareMenu();  // Open firmware menu
+            listInstalledFirmware();  // List and select installed firmware
         } else if (M5.BtnB.wasPressed()) {
             fadeOut();
             displayAvailableFirmware();  // Display and download new firmware
@@ -417,7 +422,7 @@ bool downloadAndInstallFirmware(const FirmwareInfo &info) {
                 totalRead += c;
                 len -= c;
             }
-            delay(1);
+            yield();  // Allow other tasks to run
         }
         http.end();
 
@@ -479,7 +484,7 @@ void inputPassword() {
     char passwordBuffer[32] = "";
     int length = 0;
 
-    const char* charMap = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()";
+    const char* charMap = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()_-+={[}]|:;\"'<,>.?/`~";
     int mapSize = strlen(charMap);
     int charIndex = 0;
 
@@ -516,7 +521,7 @@ void inputPassword() {
             M5.Lcd.setTextSize(2);
             M5.Lcd.setTextColor(themePrimaryColor);
             M5.Lcd.println("Password Set");
-            delay(2000);
+                        delay(2000);
             break;
         }
 
@@ -524,16 +529,6 @@ void inputPassword() {
     }
 }
 
-// WiFi selection and connection with password input
-void selectWiFiNetwork() {
-    M5.Lcd.clear();
-    M5.Lcd.setTextSize(2);
-    M5.Lcd.setTextColor(themePrimaryColor);
-    M5.Lcd.println("Scanning for WiFi networks...");
-    int numNetworks = WiFi.scanNetworks();
-    if (numThe continuation of the integrated M5 OS code:
-
-```cpp
 // WiFi selection and connection with password input
 void selectWiFiNetwork() {
     M5.Lcd.clear();
@@ -666,7 +661,7 @@ void monitorIdleState() {
 
 // Enter low power mode to save battery
 void enterLowPowerMode() {
-    M5.Power.deepSleep(0);  // Enter deep sleep mode
+    M5.Power.lightSleep();  // Enter light sleep mode for faster wake-up
 }
 
 // System health check to manage system resources
@@ -731,3 +726,7 @@ void loop() {
     checkSystemHealth();  // Continuously monitor system health
     heartbeatCheck();     // Reset the watchdog to prevent system reset
 }
+
+
+       
+
